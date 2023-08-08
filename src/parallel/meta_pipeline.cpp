@@ -87,6 +87,7 @@ MetaPipeline &MetaPipeline::CreateChildMetaPipeline(Pipeline &current, PhysicalO
 	children.push_back(make_shared<MetaPipeline>(executor, state, &op));
 	auto child_meta_pipeline = children.back().get();
 	// child MetaPipeline must finish completely before this MetaPipeline can start
+	// 设置依赖关系，child pipeline 执行完毕，当前pipeline 才能执行
 	current.AddDependency(child_meta_pipeline->GetBasePipeline());
 	// child meta pipeline is part of the recursive CTE too
 	child_meta_pipeline->recursive_cte = recursive_cte;

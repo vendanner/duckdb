@@ -15,6 +15,7 @@ namespace duckdb {
 class PhysicalRecursiveCTE;
 
 //! MetaPipeline represents a set of pipelines that all have the same sink
+//! MetaPipeline 表示一组都具有相同Sink的Pipeline
 class MetaPipeline : public std::enable_shared_from_this<MetaPipeline> {
 	//! We follow these rules when building:
 	//! 1. For joins, build out the blocking side before going down the probe side

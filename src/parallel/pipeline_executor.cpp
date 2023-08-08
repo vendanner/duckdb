@@ -106,6 +106,17 @@ bool PipelineExecutor::TryFlushCachingOperators() {
 	return true;
 }
 
+/**
+ * 一：source 还有数据时(exhausted_source=false)，FetchFromSource 获取数据
+ * 		-> pipeline.source->GetData
+ * 二：ExecutePushInternal
+ * 		operators->execute => sink
+ * 		PipelineExecutor::ExecutePushInternal() 可以看做是 Pipeline 内的数据消费者。
+ * 三：PushFinalize
+ * 		sink->combine
+ * @param max_chunks
+ * @return
+ */
 PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 	D_ASSERT(pipeline.sink);
 	auto &source_chunk = pipeline.operators.empty() ? final_chunk : *intermediate_chunks[0];
@@ -207,6 +218,7 @@ OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t
 		// Note: if input is the final_chunk, we don't do any executing, the chunk just needs to be sinked
 		if (&input != &final_chunk) {
 			final_chunk.Reset();
+			// 执行 operator.execute
 			result = Execute(input, final_chunk, initial_idx);
 			if (result == OperatorResultType::FINISHED) {
 				return OperatorResultType::FINISHED;
@@ -215,12 +227,12 @@ OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t
 			result = OperatorResultType::NEED_MORE_INPUT;
 		}
 		auto &sink_chunk = final_chunk;
-		if (sink_chunk.size() > 0) {
+		if (sink_chunk.size() > 0) {		// 说明operator 都已执行，轮到sink->sink 执行了
 			StartOperator(*pipeline.sink);
 			D_ASSERT(pipeline.sink);
 			D_ASSERT(pipeline.sink->sink_state);
 			OperatorSinkInput sink_input {*pipeline.sink->sink_state, *local_sink_state, interrupt_state};
-
+			// operator.Sink
 			auto sink_result = Sink(sink_chunk, sink_input);
 
 			EndOperator(*pipeline.sink, nullptr);

@@ -64,6 +64,11 @@ struct ScheduleEventData {
 	event_map_t event_map;
 };
 
+/**
+ * 创建 pipeline events
+ * @param meta_pipeline
+ * @param event_data
+ */
 void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, ScheduleEventData &event_data) {
 	D_ASSERT(meta_pipeline);
 	auto &events = event_data.events;
@@ -105,6 +110,7 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 		} else {
 			pipeline_finish_event_ptr = &base_stack.pipeline_finish_event;
 		}
+		// 设置同个meta_pipeline 内pipeline 间event 依赖
 		PipelineEventStack pipeline_stack(base_stack.pipeline_initialize_event, *pipeline_event,
 		                                  *pipeline_finish_event_ptr, base_stack.pipeline_complete_event);
 		events.push_back(std::move(pipeline_event));
@@ -145,9 +151,22 @@ void Executor::SchedulePipeline(const shared_ptr<MetaPipeline> &meta_pipeline, S
 	}
 }
 
+/**
+ * 第⼀步：创建所有必需的pipeline events
+ * 		遍历所有的MetaPipeline(即to_schedule，初始化传递进来的不含根的MetaPipeline)
+ * 		通过SchedulePipeline 函数来完成ScheduleEventData 内部events 与event_map 的构建
+ * 第⼆步: 跨 MetaPipelines 设置依赖关系
+ * 		迭代event_map的每条记录，key是pipline，value是这个pipeline的所有events，根据当前pipeline拿到其依赖的
+		pipeline，依赖pipeline的pipeline_complete_event放⼊当前pipeline_event依赖数组中。
+        简单总结⼀下就是MetaPipeline1有A pipeline, MetaPipeline2有B pipeline，如果2依赖1，那么
+		2.pipeline_event.parents.push_back(1.pipeline.pipeline_complete_event)。
+*  第三步：验证是否有循环依赖，只有debug模式才会开启，可能是因为性能问题。
+ * 第四步：枚举每个events，调度所有没有依赖的event。
+ * @param event_data
+ */
 void Executor::ScheduleEventsInternal(ScheduleEventData &event_data) {
 	auto &events = event_data.events;
-	D_ASSERT(events.empty());
+	D_ASSERT(events.empty());		// 保证在这之前 events 为空
 
 	// create all the required pipeline events
 	for (auto &pipeline : event_data.meta_pipelines) {
@@ -164,6 +183,7 @@ void Executor::ScheduleEventsInternal(ScheduleEventData &event_data) {
 			auto event_map_entry = event_map.find(*dep);
 			D_ASSERT(event_map_entry != event_map.end());
 			auto &dep_entry = event_map_entry->second;
+			// 设置跨 meta_pipeline 之间的event 依赖
 			entry.second.pipeline_event.AddDependency(dep_entry.pipeline_complete_event);
 		}
 	}
@@ -312,6 +332,10 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		PipelineBuildState state;
 		auto root_pipeline = make_shared<MetaPipeline>(*this, state, nullptr);
 		root_pipeline->Build(*physical_plan);
+		// 以上构建完所有 pipelines
+
+		// std::reverse(operators.begin(), operators.end());
+		// 调转operator，因为构建是从上到下，执行是从下到上，那么就从operator[0]-[size]执行
 		root_pipeline->Ready();
 
 		// ready recursive cte pipelines too

@@ -16,13 +16,16 @@ namespace duckdb {
 class Executor;
 class Task;
 
+// 声明了纯虚函数的类是一个抽象类。所以，用户不能创建类的实例，只能创建它的派生类的实例。
 class Event : public std::enable_shared_from_this<Event> {
 public:
 	Event(Executor &executor);
 	virtual ~Event() = default;
 
 public:
+	// virtual + (=0) 是虚函数，子类必须继承
 	virtual void Schedule() = 0;
+	// virtual + ({}) 是虚函数，子类不是必须继承，可直接调用，相当于没有任何操作
 	//! Called right after the event is finished
 	virtual void FinishEvent() {
 	}

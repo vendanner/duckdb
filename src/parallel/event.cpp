@@ -18,7 +18,7 @@ void Event::CompleteDependency() {
 		// all dependencies have been completed: schedule the event
 		D_ASSERT(total_tasks == 0);
 		Schedule();
-		if (total_tasks == 0) {
+		if (total_tasks == 0) {		// 若当前 event 不生成 task，直接执行 finish
 			Finish();
 		}
 	}

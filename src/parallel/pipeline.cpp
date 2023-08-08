@@ -166,10 +166,12 @@ bool Pipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
 	}
 
 	// launch a task for every thread
+	// 并行任务 PipelineTask，以pipeline 为单位
 	vector<shared_ptr<Task>> tasks;
 	for (idx_t i = 0; i < max_threads; i++) {
 		tasks.push_back(make_uniq<PipelineTask>(*this, event));
 	}
+	// 任务写入TaskScheduler 队列，等待调度
 	event->SetTasks(std::move(tasks));
 	return true;
 }

@@ -9,6 +9,9 @@ PipelineFinishEvent::PipelineFinishEvent(shared_ptr<Pipeline> pipeline_p) : Base
 void PipelineFinishEvent::Schedule() {
 }
 
+/**
+ * 调用 sink->Finalize
+ */
 void PipelineFinishEvent::FinishEvent() {
 	pipeline->Finalize(*this);
 }

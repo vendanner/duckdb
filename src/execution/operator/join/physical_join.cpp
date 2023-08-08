@@ -40,10 +40,12 @@ void PhysicalJoin::BuildJoinPipelines(Pipeline &current, MetaPipeline &meta_pipe
 	auto last_pipeline = pipelines_so_far.back().get();
 
 	// on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
+	// 构建build 侧的 pipeline
 	auto &child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, op);
 	child_meta_pipeline.Build(*op.children[1]);
 
 	// continue building the current pipeline on the LHS (probe side)
+	// 构建probe ，直接在原有的pipeline
 	op.children[0]->BuildPipelines(current, meta_pipeline);
 
 	switch (op.type) {

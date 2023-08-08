@@ -42,6 +42,7 @@ void PhysicalResultCollector::BuildPipelines(Pipeline &current, MetaPipeline &me
 	D_ASSERT(children.empty());
 
 	// single operator: the operator becomes the data source of the current pipeline
+	// 当前operator 作为current 的source
 	auto &state = meta_pipeline.GetState();
 	state.SetPipelineSource(current, *this);
 
