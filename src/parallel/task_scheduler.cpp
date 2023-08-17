@@ -23,16 +23,22 @@ struct SchedulerThread {
 #endif
 };
 
+// https://blog.csdn.net/caoshangpa/article/details/78506322 分析 duckdb_moodycamel::ConcurrentQueue
 #ifndef DUCKDB_NO_THREADS
 typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
+/**
+ * 线程都阻塞在 semaphore，
+ *   当有任务插入队列时，semaphore 会唤醒某个线程
+ *   唤醒的线程从队列取任务执行，然后继续阻塞在 semaphore
+ */
 struct ConcurrentQueue {
-	concurrent_queue_t q;
-	lightweight_semaphore_t semaphore;
+	concurrent_queue_t q;				// 并发队列
+	lightweight_semaphore_t semaphore;	// 信号量，控制线程何时能拿到任务
 
-	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
-	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task);
+	void Enqueue(ProducerToken &token, shared_ptr<Task> task);	// 插入任务
+	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task); // 队列中取某个生产者的任务
 };
 
 struct QueueProducerToken {
@@ -45,7 +51,7 @@ struct QueueProducerToken {
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 	lock_guard<mutex> producer_lock(token.producer_lock);
 	if (q.enqueue(token.token->queue_token, std::move(task))) {
-		semaphore.signal();
+		semaphore.signal();	// 队列中有任务了，唤醒某个阻塞在取任务的线程
 	} else {
 		throw InternalException("Could not schedule task!");
 	}
@@ -126,22 +132,25 @@ bool TaskScheduler::GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &
 
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 #ifndef DUCKDB_NO_THREADS
-	shared_ptr<Task> task;
+	shared_ptr<Task> task;	// Task 最开始是 PipelineTask
 	// loop until the marker is set to false
 	while (*marker) {
-		// wait for a signal with a timeout
-		queue->semaphore.wait();
-		if (queue->q.try_dequeue(task)) {
+		// wait for a signal with a timeout 没任务会阻塞
+		queue->semaphore.wait();	// 队列中没任务，阻塞
+		if (queue->q.try_dequeue(task)) {	// 尝试取任务
 			auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
 			case TaskExecutionResult::TASK_ERROR:
-				task.reset();
+				task.reset();	// 清理 task
 				break;
 			case TaskExecutionResult::TASK_NOT_FINISHED:
 				throw InternalException("Task should not return TASK_NOT_FINISHED in PROCESS_ALL mode");
 			case TaskExecutionResult::TASK_BLOCKED:
+				// 取消任务后，会将任务加入到 to_be_rescheduled_tasks map
+				// 若开启 DUCKDB_DEBUG_ASYNC_SINK_SOURCE，
+				// 		在调用此代码前会调用interrupt_state.Callback 在to_be_rescheduled_tasks 搜任务并重新加入队列
 				task->Deschedule();
 				task.reset();
 				break;
@@ -247,6 +256,12 @@ void TaskScheduler::Signal(idx_t n) {
 #endif
 }
 
+/**
+ * 设置后台线程数
+ *   缩小后台线程数时，等待所有线程执行完成，然后再新建相应的后台线程
+ *   每个后台线程有对应的执行开关在 vector<unique_ptr<atomic<bool>>> markers;
+ * @param n
+ */
 void TaskScheduler::SetThreadsInternal(int32_t n) {
 #ifndef DUCKDB_NO_THREADS
 	if (threads.size() == idx_t(n - 1)) {
@@ -258,6 +273,8 @@ void TaskScheduler::SetThreadsInternal(int32_t n) {
 		for (idx_t i = 0; i < threads.size(); i++) {
 			*markers[i] = false;
 		}
+		// 唤醒阻塞的后台线程，这样才能使后台线程退出
+		// 		=> 后台线程会阻塞在从队列中取数据
 		Signal(threads.size());
 		// now join the threads to ensure they are fully stopped before erasing them
 		for (idx_t i = 0; i < threads.size(); i++) {
@@ -273,6 +290,7 @@ void TaskScheduler::SetThreadsInternal(int32_t n) {
 		for (idx_t i = 0; i < create_new_threads; i++) {
 			// launch a thread and assign it a cancellation marker
 			auto marker = unique_ptr<atomic<bool>>(new atomic<bool>(true));
+			// 创建一个thread 后，会立即开始执行，此时已经执行
 			auto worker_thread = make_uniq<thread>(ThreadExecuteTasks, this, marker.get());
 			auto thread_wrapper = make_uniq<SchedulerThread>(std::move(worker_thread));
 

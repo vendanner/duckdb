@@ -211,7 +211,7 @@ void DatabaseInstance::Initialize(const char *database_path, DBConfig *user_conf
 		// temporary directories explicitly disabled
 		config.options.temporary_directory = string();
 	}
-
+    // 创建所需组件
 	db_manager = make_uniq<DatabaseManager>(*this);
 	buffer_manager = make_uniq<StandardBufferManager>(*this, config.options.temporary_directory);
 	scheduler = make_uniq<TaskScheduler>(*this);
@@ -325,6 +325,7 @@ void DatabaseInstance::Configure(DBConfig &new_config) {
 	if (config.options.maximum_memory == (idx_t)-1) {
 		config.SetDefaultMaxMemory();
 	}
+	// 设置并发数 = CPU内核的数量
 	if (new_config.options.maximum_threads == (idx_t)-1) {
 		config.SetDefaultMaxThreads();
 	}

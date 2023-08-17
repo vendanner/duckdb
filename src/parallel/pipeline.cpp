@@ -58,6 +58,8 @@ public:
 			}
 		}
 
+		// event 生成的task finish 个数判断
+		// 若task 都结束，标记此 event 完成
 		event->FinishTask();
 		pipeline_executor.reset();
 		return TaskExecutionResult::TASK_FINISHED;

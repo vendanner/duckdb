@@ -107,8 +107,47 @@ bool PipelineExecutor::TryFlushCachingOperators() {
 }
 
 /**
- * 一：source 还有数据时(exhausted_source=false)，FetchFromSource 获取数据
+ * Pipeline 处理顺序是 Source->Operators->Sink
+ *	Execute：从source 获取数据 inputdata，给ExecutePushInternal 消费
+ *		收到ExecutePushInternal 返回 NEED_MORE_INPUT：
+ *			若source 数据都已获取且已输出：退出，当前Pipeline 执行完毕
+ *			若source 数据都已获取但存在in_process_operators：当前inputdata 给ExecutePushInternal
+ *			若source 还有数据，getdata，给ExecutePushInternal
+ *		收到ExecutePushInternal 返回 FINISHED：退出，当前Pipeline 执行结束
+ *		ExecutePushInternal：将inputdata 给operators 消费，结果继续给Sink 消费
+ *			收到Execute 返回 NEED_MORE_INPUT：等sink 消费后，向上层返回NEED_MORE_INPUT，需要继续输入新的 inputdata
+ *			收到Execute 返回 FINISHED：返回FINISHED 表示直接结束
+ *			收到Execute 返回 HAVE_MORE_OUTPUT：表示Execute 要再消费一次当前 inputdata，继续Execute(inputdata)
+ *			Execute(DataChunk）：将inputdata 按顺序给operator 处理
+ *				返回 NEED_MORE_INPUT 表示当前inputdata 所有operator 都已处理完毕，请求继续输入新的 inputdata
+ *				返回 FINISHED：operator 不再处理，提前结束
+ *				返回 HAVE_MORE_OUTPUT：当前inputdata 再输入，需要重新处理产生新的输出
+ *
+ * 初始状态 exhausted_source = false 和 in_process_operators.isempty
+ * 	source 有数据，FetchFromSource 获取数据
  * 		-> pipeline.source->GetData
+ * 		若source 返回FINISHED 表示source 数据已全部获取，设置 exhausted_source=true
+ * 		否则调用ExecutePushInternal 执行Operators
+ * 	ExecutePushInternal：operators->sink 执行
+ * 		返回三种状态
+ * 			NEED_MORE_INPUT： 上层循环继续，看情况输入不同的data 调此函数
+ * 			FINISHED：上层结束循环，该pipeline 收尾
+ * 			BLOCKED：上层直接退出循环，进入异常处理
+ * 		Execute: operators 执行
+ * 			返回三种状态
+ * 				NEED_MORE_INPUT：上层返回 NEED_MORE_INPUT(表示当前批次数据已处理完)
+ * 				FINISHED：上层返回 FINISHED
+ * 				HAVE_MORE_OUTPUT：上层继续循环调用此函数，让operator 输出
+ *
+ * 当 exhausted_source=true，done_flushing=false 时
+ * 	什么时候会发生这种情况？ FetchFromSource 一次调用将全部数据获取完毕
+ * 	调用 TryFlushCachingOperators，内部也会调 ExecutePushInternal，执行一遍所有的 Operators
+ *  一次数据处理流程：source->operatos->sink，反复调用直到 source 无数据；
+ *  当一次性就能获取source 时，执行operatos->sink 即可无需再重复
+ *
+ * 当 in_process_operators 不为空时，表示有 operator 需要之前的数据重新再调用(HAVE_MORE_OUTPUT)
+ * 	ExecutePushInternal(source_chunk)
+ *
  * 二：ExecutePushInternal
  * 		operators->execute => sink
  * 		PipelineExecutor::ExecutePushInternal() 可以看做是 Pipeline 内的数据消费者。
@@ -153,7 +192,7 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 			SourceResultType source_result = FetchFromSource(source_chunk);
 
 			if (source_result == SourceResultType::BLOCKED) {
-				return PipelineExecuteResult::INTERRUPTED;
+				return PipelineExecuteResult::INTERRUPTED;		// 处理方式和下面的sink 相同
 			}
 
 			if (source_result == SourceResultType::FINISHED) {
@@ -170,6 +209,9 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 		// SINK INTERRUPT
 		if (result == OperatorResultType::BLOCKED) {
 			remaining_sink_chunk = true;
+			// 返回 INTERRUPTED，上层PipelineTask 会TASK_BLOCKED，
+			// 继而TaskScheduler 取消此任务调度
+			// 只会发生在source/sink 异步的情况，这是个新特性，当前版本还在测试
 			return PipelineExecuteResult::INTERRUPTED;
 		}
 
@@ -179,6 +221,8 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 	}
 
 	if ((!exhausted_source || !done_flushing) && !IsFinished()) {
+		// 大部分情况下，不应该执行到这里，只能是Finish 返回
+		// NOT_FINISHED 返回是异常情况 PipelineTask 会抛异常
 		return PipelineExecuteResult::NOT_FINISHED;
 	}
 
@@ -188,7 +232,7 @@ PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
 }
 
 PipelineExecuteResult PipelineExecutor::Execute() {
-	return Execute(NumericLimits<idx_t>::Maximum());
+	return Execute(NumericLimits<idx_t>::Maximum()); // uint64_t 最大值
 }
 
 OperatorResultType PipelineExecutor::ExecutePush(DataChunk &input) { // LCOV_EXCL_START
@@ -204,6 +248,19 @@ bool PipelineExecutor::IsFinished() {
 	return finished_processing_idx >= 0;
 }
 
+/**
+ * 执行 operators-> sink 流程
+ *	Execute 执行operators.execute，返回状态
+ *		NEED_MORE_INPUT：表示当前批次数据已处理完毕，sink 后返回上层，等待新批次数据调用
+ *		FINISHED：operator结束，直接返回FINISHED，整个pipeline 任务结束
+ *		HAVE_MORE_OUTPUT：用当前input 继续调用Execute
+ *	只要不是FINISHED，operator 返回的data 会让Sink->sink 处理
+ *	sink 函数只要不返回 FINISHED，继续循环
+ *
+ * @param input
+ * @param initial_idx 默认是0
+ * @return
+ */
 OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t initial_idx) {
 	D_ASSERT(pipeline.sink);
 	if (input.size() == 0) { // LCOV_EXCL_START
@@ -218,7 +275,7 @@ OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t
 		// Note: if input is the final_chunk, we don't do any executing, the chunk just needs to be sinked
 		if (&input != &final_chunk) {
 			final_chunk.Reset();
-			// 执行 operator.execute
+			// 执行 operators.execute
 			result = Execute(input, final_chunk, initial_idx);
 			if (result == OperatorResultType::FINISHED) {
 				return OperatorResultType::FINISHED;
@@ -240,6 +297,7 @@ OperatorResultType PipelineExecutor::ExecutePushInternal(DataChunk &input, idx_t
 			if (sink_result == SinkResultType::BLOCKED) {
 				return OperatorResultType::BLOCKED;
 			} else if (sink_result == SinkResultType::FINISHED) {
+				// 直接结束整个Pipeline 任务
 				FinishProcessing();
 				return OperatorResultType::FINISHED;
 			}
@@ -340,6 +398,14 @@ void PipelineExecutor::PullFinalize() {
 	pipeline.executor.Flush(thread);
 }
 
+/**
+ * 校准当前operators 要开始执行的operator 序号
+ * 	一般情况时从 initial_idx 开始执行
+ * 	当之前有operator 还没处理结束(HAVE_MORE_OUTPUT)，将序号设置为之前的operator 序号
+ *
+ * @param current_idx 后续要执行的序号
+ * @param initial_idx 初始序号
+ */
 void PipelineExecutor::GoToSource(idx_t &current_idx, idx_t initial_idx) {
 	// we go back to the first operator (the source)
 	current_idx = initial_idx;
@@ -353,6 +419,27 @@ void PipelineExecutor::GoToSource(idx_t &current_idx, idx_t initial_idx) {
 	D_ASSERT(current_idx >= initial_idx);
 }
 
+/**
+ * 按顺序执行operator
+ *	GoToSource： 校准下面从哪个opeartor 开始执行
+ *		存在 in_process_operators，直接从in_process_operators 开始，
+ *		因为当前输入的数据，在in_process_operators 之前的operator 上次已执行没必要重新执行
+ *	判断operators 是否都已执行，返回 NEED_MORE_INPUT
+ *	while：遍历执行operator
+ *		operator 返回HAVE_MORE_OUTPUT： in_process_operators，
+ *			Execute(idx_t max_chunks) 函数中决定是否将之前数据重新调用 operators-sink 流程
+ *		operator 返回无数据，重置下一个执行operator 为初始(重新获取数据)
+ *		执行的operator 序号++
+ * 	返回三种状态
+ * 		NEED_MORE_INPUT：上层继续往上 NEED_MORE_INPUT(表示当前批次数据已处理完)
+ * 		FINISHED：上层继续往上 FINISHED，意为结束此Pipeline
+ * 		HAVE_MORE_OUTPUT：上层继续循环调用此函数(数据重复)，让operator 输出
+ *
+ * @param input
+ * @param result
+ * @param initial_idx 开始执行的operator 序号(在生成pipeline时，确定好了序号)
+ * @return
+ */
 OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result, idx_t initial_idx) {
 	if (input.size() == 0) { // LCOV_EXCL_START
 		return OperatorResultType::NEED_MORE_INPUT;
@@ -364,6 +451,7 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 	if (current_idx == initial_idx) {
 		current_idx++;
 	}
+	// 全部 operators 都已执行
 	if (current_idx > pipeline.operators.size()) {
 		result.Reference(input);
 		return OperatorResultType::NEED_MORE_INPUT;
@@ -375,6 +463,9 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 		// now figure out where to put the chunk
 		// if current_idx is the last possible index (>= operators.size()) we write to the result
 		// otherwise we write to an intermediate chunk
+
+		// 每个operator 都属于自己的输出 DataChunk，
+		// 最后一个operator 的输出 DataChunk 是result
 		auto current_intermediate = current_idx;
 		auto &current_chunk =
 		    current_intermediate >= intermediate_chunks.size() ? result : *intermediate_chunks[current_intermediate];
@@ -397,9 +488,12 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 			if (result == OperatorResultType::HAVE_MORE_OUTPUT) {
 				// more data remains in this operator
 				// push in-process marker
+				// 保存哪些 operator 正在处理当前批次数据，上层不需要再获取新数据，
+				// 将当前批次数据重新调用
 				in_process_operators.push(current_idx);
 			} else if (result == OperatorResultType::FINISHED) {
 				D_ASSERT(current_chunk.size() == 0);
+				// 直接结束整个Pipeline 任务
 				FinishProcessing(current_idx);
 				return OperatorResultType::FINISHED;
 			}
@@ -408,6 +502,9 @@ OperatorResultType PipelineExecutor::Execute(DataChunk &input, DataChunk &result
 
 		if (current_chunk.size() == 0) {
 			// no output from this operator!
+			// 无数据返回，若是执行的第一个operator，直接退出
+			// 若不是执行的第一个operator，重置下一个执行operator 为初始(重新获取数据)
+			//		类似于 filter 操作将数据全部过滤了，那么后续操作没必要执行
 			if (current_idx == initial_idx) {
 				// if we got no output from the scan, we are done
 				break;
@@ -473,6 +570,12 @@ SinkResultType PipelineExecutor::Sink(DataChunk &chunk, OperatorSinkInput &input
 	return pipeline.sink->Sink(context, chunk, input);
 }
 
+/**
+ * 从Source 获取数据
+ * 	pipeline.source->GetData 获取一批数据
+ * @param result
+ * @return
+ */
 SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 	StartOperator(*pipeline.source);
 
